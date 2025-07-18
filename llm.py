@@ -9,7 +9,7 @@ def main():
     torch.cuda.empty_cache()
 
     print("📦 Loading and filtering dataset...")
-    dataset = load_dataset("sahil2801/CodeAlpaca-20k", split="train[:10%]")  
+    dataset = load_dataset("sahil2801/CodeAlpaca-20k", split="train[:60%]")  
     keywords = ["refactor", "optimize", "clean", "secure", "improve", "fix"]
     filtered_dataset = dataset.filter(
         lambda x: any(kw in x["instruction"].lower() for kw in keywords)

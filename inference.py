@@ -7,7 +7,6 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import torch
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Define globals
 model = None
 tokenizer = None
 
@@ -17,9 +16,7 @@ def load_model():
         print("[LOG] Loading merged model and tokenizer...")
         merged_model_path = "./merged-codet5p-model"
         tokenizer = AutoTokenizer.from_pretrained(merged_model_path)
-
         model = AutoModelForSeq2SeqLM.from_pretrained(merged_model_path)
-
         model.eval()
         print("[LOG] Merged model loaded and ready.")
 
@@ -50,6 +47,29 @@ def read_code_file(filepath):
     except Exception:
         return None
 
+language_map = {
+    ".py": "python",
+    ".js": "javascript",
+    ".java": "java",
+    ".ts": "typescript",
+    ".cpp": "cpp",
+    ".c": "c",
+    ".go": "go",
+    ".rs": "rust",
+    ".rb": "ruby",
+    ".php": "php",
+    ".cs": "csharp",
+    ".swift": "swift"
+}
+
+def split_response(full_response):
+    parts = full_response.split("### 🧠 Explanation:")
+    if len(parts) == 2:
+        refactored = parts[0].replace("### ✨ Refactored Code:", "").strip("` \n")
+        explanation = parts[1].strip()
+        return refactored, explanation
+    return full_response, "Explanation not found."
+
 def analyze_and_refactor(code_snippets):
     print(f"[LOG] Starting threaded refactoring for {len(code_snippets)} files...")
 
@@ -57,25 +77,26 @@ def analyze_and_refactor(code_snippets):
 
     def process_file(item):
         filepath, code = item
-        prompt = f"Refactor the following code:\n{code}"
+        file_ext = os.path.splitext(filepath)[1]
+        language = language_map.get(file_ext, "")
+
+        prompt = (
+            f"Refactor the following {language} code and format the output as:\n"
+            f"### ✨ Refactored Code:\n```{language}\n<refactored code>\n```\n\n"
+            f"### 🧠 Explanation:\n<clear explanation of what changed and why>\n\n"
+            f"Code:\n{code}"
+        )
+
         input_ids = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).input_ids.to(device)
 
         with torch.no_grad():
-            outputs = model.generate(input_ids=input_ids, max_new_tokens=256)
+            outputs = model.generate(input_ids=input_ids, max_new_tokens=512)
 
-        refactored_code = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-        explanation_prompt = f"Explain the changes made in this refactoring and why they improve the code:\n\nOriginal Code:\n{code}\n\nRefactored Code:\n{refactored_code}"
-        explanation_input_ids = tokenizer(explanation_prompt, return_tensors="pt", truncation=True, max_length=512).input_ids.to(device)
-
-        with torch.no_grad():
-            explanation_output = model.generate(input_ids=explanation_input_ids, max_new_tokens=256)
-
-        explanation = tokenizer.decode(explanation_output[0], skip_special_tokens=True)
+        full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        refactored_code, explanation = split_response(full_response)
 
         print(f"[LOG] ✅ Refactored: {os.path.basename(filepath)}")
-        return (filepath, refactored_code, explanation)
-
+        return (filepath, refactored_code, explanation, language)
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         results = list(executor.map(process_file, code_snippets))
@@ -85,9 +106,9 @@ def analyze_and_refactor(code_snippets):
 
 def format_results(results):
     output = ""
-    for path, refactored_code, explanation in results:
+    for path, refactored_code, explanation, language in results:
         output += f"### 📄 File: {path}\n\n"
-        output += f"#### ✨ Refactored Code:\n```go\n{refactored_code}\n```\n\n"
+        output += f"#### ✨ Refactored Code:\n```{language}\n{refactored_code}\n```\n\n"
         output += f"#### 🧠 Explanation:\n{explanation}\n"
         output += f"\n{'-'*80}\n\n"
     return output
@@ -116,7 +137,7 @@ def process_github_repo(repo_url):
             return f"❌ Error: {str(e)}"
 
 with gr.Blocks() as demo:
-    gr.Markdown("## 🛠️ Multi-language Code Refactor & Vulnerability Analyzer")
+    gr.Markdown("## 🛠️ Multi-language Code Refactor & Explanation Engine")
     repo_input = gr.Textbox(label="GitHub Repository URL", placeholder="https://github.com/user/repo")
     analyze_btn = gr.Button("Analyze & Refactor")
     output_box = gr.Textbox(label="Results", lines=30, interactive=False)
