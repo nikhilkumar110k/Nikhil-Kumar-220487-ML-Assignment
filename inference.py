@@ -6,6 +6,7 @@ from git import Repo
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import torch
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 
 model = None
 tokenizer = None
@@ -63,12 +64,15 @@ language_map = {
 }
 
 def split_response(full_response):
-    parts = full_response.split("### 🧠 Explanation:")
-    if len(parts) == 2:
-        refactored = parts[0].replace("### ✨ Refactored Code:", "").strip("` \n")
-        explanation = parts[1].strip()
+    explanation_header = re.search(r"(#{2,4}\s*🧠\s*Explanation\s*:?)", full_response, re.IGNORECASE)
+    
+    if explanation_header:
+        idx = explanation_header.start()
+        refactored = full_response[:idx].replace("### ✨ Refactored Code:", "").strip("` \n")
+        explanation = full_response[idx + len(explanation_header.group(0)):].strip()
         return refactored, explanation
-    return full_response, "Explanation not found."
+    
+    return full_response.strip(), "Explanation not found."
 
 def analyze_and_refactor(code_snippets):
     print(f"[LOG] Starting threaded refactoring for {len(code_snippets)} files...")
@@ -81,11 +85,12 @@ def analyze_and_refactor(code_snippets):
         language = language_map.get(file_ext, "")
 
         prompt = (
-            f"Refactor the following {language} code and format the output as:\n"
-            f"### ✨ Refactored Code:\n```{language}\n<refactored code>\n```\n\n"
-            f"### 🧠 Explanation:\n<clear explanation of what changed and why>\n\n"
-            f"Code:\n{code}"
-        )
+    f"Refactor the following {language} code. Respond in Markdown format with:\n"
+    f"### ✨ Refactored Code:\n```{language}\n...\n```\n\n"
+    f"### 🧠 Explanation:\n...\n\n"
+    f"Code:\n{code}\n"
+)
+
 
         input_ids = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).input_ids.to(device)
 
