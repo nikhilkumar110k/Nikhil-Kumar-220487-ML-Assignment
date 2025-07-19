@@ -80,3 +80,11 @@ Explain the changes in simple terms
 Provide optimization and readability suggestions
 
 You can replace it with any Seq2Seq model trained on similar data.
+
+
+screenshots:
+<img width="1550" height="922" alt="image" src="https://github.com/user-attachments/assets/829f8b1d-6dd9-4f66-9d7e-664cbdb27f0d" />
+
+<img width="1550" height="850" alt="image" src="https://github.com/user-attachments/assets/1d6b5147-52bf-4670-8670-f4c174fc60ce" />
+
+
