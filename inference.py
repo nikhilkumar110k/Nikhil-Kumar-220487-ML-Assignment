@@ -3,7 +3,7 @@ import os
 import tempfile
 import shutil
 from git import Repo
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 import torch
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
@@ -11,46 +11,53 @@ import json
 from pathlib import Path
 from sentence_transformers import SentenceTransformer, util
 
+def clean_invalid_unicode(text):
+    if isinstance(text, str):
+        return text.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    return text
+
 model = None
 tokenizer = None
 retriever_model = SentenceTransformer("all-MiniLM-L6-v2")
 
+explanation_tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
+explanation_model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
+explanation_pipeline = pipeline("text2text-generation", model=explanation_model, tokenizer=explanation_tokenizer)
+
 language_map = {
-    ".py": "python",
-    ".js": "javascript",
-    ".java": "java",
-    ".ts": "typescript",
-    ".cpp": "cpp",
-    ".c": "c",
-    ".go": "go",
-    ".rs": "rust",
-    ".rb": "ruby",
-    ".php": "php",
-    ".cs": "csharp",
-    ".swift": "swift"
+    ".py": "python", ".js": "javascript", ".java": "java", ".ts": "typescript",
+    ".cpp": "cpp", ".c": "c", ".go": "go", ".rs": "rust", ".rb": "ruby",
+    ".php": "php", ".cs": "csharp", ".swift": "swift"
 }
 
 retriever_db_path = "instruction_dataset.jsonl"
-retriever_index = []
-retriever_instructions = []
-retriever_outputs = []
+retriever_index, retriever_instructions, retriever_outputs = [], [], []
 
 if os.path.exists(retriever_db_path):
     with open(retriever_db_path, "r", encoding="utf-8") as f:
         for line in f:
             entry = json.loads(line)
-            retriever_outputs.append(entry["output"])
-            retriever_instructions.append(entry["instruction"])
+            retriever_outputs.append(clean_invalid_unicode(entry["output"]))
+            retriever_instructions.append(clean_invalid_unicode(entry["instruction"]))
     retriever_index = retriever_model.encode(retriever_outputs, convert_to_tensor=True)
 
-
-def retrieve_similar_instruction_contexts(code, top_k=3):
-    if not retriever_index:
+def retrieve_similar_contexts(code, corpus, top_k=3):
+    if not corpus:
         return ""
     query_embedding = retriever_model.encode(code, convert_to_tensor=True)
-    hits = util.semantic_search(query_embedding, retriever_index, top_k=top_k)[0]
-    contexts = [retriever_instructions[hit['corpus_id']] for hit in hits]
-    return "\n\n".join(contexts)
+    hits = util.semantic_search(query_embedding, corpus, top_k=top_k)[0]
+    return "\n".join([corpus[hit["index"]] for hit in hits])
+
+def retrieve_similar_output_contexts(code, top_k=3):
+    return retrieve_similar_contexts(code, retriever_outputs, top_k)
+
+def retrieve_similar_instruction_contexts(code, top_k=3):
+    return retrieve_similar_contexts(code, retriever_instructions, top_k)
+
+def retrieve_combined_instruction_output_contexts(code, top_k=3):
+    instructions = retrieve_similar_instruction_contexts(code, top_k)
+    outputs = retrieve_similar_output_contexts(code, top_k)
+    return instructions + "\n\n" + outputs
 
 def fallback_rag_inference(prompt, fallback_docs=None):
     if fallback_docs is None:
@@ -63,7 +70,8 @@ def fallback_rag_inference(prompt, fallback_docs=None):
         ]
     import difflib
     closest_doc = difflib.get_close_matches(prompt, fallback_docs, n=1)
-    return closest_doc[0] if closest_doc else "No helpful explanation found."
+    response = closest_doc[0] if closest_doc else "No helpful explanation found."
+    return clean_invalid_unicode(response)
 
 def load_model():
     global model, tokenizer
@@ -75,15 +83,14 @@ def load_model():
         model.eval()
         print("[LOG] Merged model loaded and ready.")
 
-def clone_repo(repo_url: str, clone_dir: str):
+def clone_repo(repo_url, clone_dir):
     if os.path.exists(clone_dir):
         shutil.rmtree(clone_dir)
     Repo.clone_from(repo_url, clone_dir)
 
-def get_code_files(repo_dir: str):
-    code_files = []
+def get_code_files(repo_dir):
+    code_files, futures = [], []
     with ThreadPoolExecutor() as executor:
-        futures = []
         for root, _, files in os.walk(repo_dir):
             for file in files:
                 if file.endswith(tuple(language_map.keys())):
@@ -98,18 +105,41 @@ def get_code_files(repo_dir: str):
 def read_code_file(filepath):
     try:
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-            return (filepath, f.read())
+            content = f.read()
+            return (filepath, clean_invalid_unicode(content))
     except Exception:
         return None
 
-def split_response(full_response):
-    explanation_header = re.search(r"(#{2,4}\s*🧠\s*Explanation\s*:?)", full_response, re.IGNORECASE)
-    if explanation_header:
-        idx = explanation_header.start()
-        refactored = full_response[:idx].replace("### ✨ Refactored Code:", "").strip("` \n")
-        explanation = full_response[idx + len(explanation_header.group(0)):].strip()
-        return refactored, explanation
-    return full_response.strip(), "Explanation not found."
+def generate_explanation_and_suggestions(code: str, refactored_code: str, language: str = "code", context: str = "") -> (str, str):
+    prompt = f"""
+You are a code reviewer. Analyze the changes and give suggestions.
+
+### Context:
+{context}
+
+### Original Code:
+{code}
+
+### Refactored Code:
+{refactored_code}
+
+Please do two things:
+1. Explain what was changed and why.
+2. Suggest improvements, edge cases, or potential bugs still remaining.
+""".strip()
+
+    try:
+        if len(prompt.split()) > 400:
+            prompt = prompt[:1500]
+        result = explanation_pipeline(prompt, max_length=512, do_sample=False)
+        output_text = result[0]['generated_text']
+        # Optional split logic if explanation and suggestions are clearly separated
+        return clean_invalid_unicode(output_text), ""
+    except Exception:
+        fallback = fallback_rag_inference(code)
+        return fallback, ""
+
+
 
 def analyze_and_refactor(code_snippets):
     print(f"[LOG] Starting threaded refactoring for {len(code_snippets)} files...")
@@ -119,44 +149,43 @@ def analyze_and_refactor(code_snippets):
         filepath, code = item
         file_ext = os.path.splitext(filepath)[1]
         language = language_map.get(file_ext, "")
-
         context = retrieve_similar_instruction_contexts(code)
-
         prompt = (
             f"Refactor the following {language} code. Respond in Markdown format with:\n"
             f"### ✨ Refactored Code:\n```{language}\n...\n```\n\n"
             f"### 🧠 Explanation:\n...\n\n"
-            f"Code:\n{code}\n\n"
-            f"Context:\n{context}\n"
+            f"Code:\n{code}\n\nContext:\n{context}\n"
         )
-
         input_ids = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).input_ids.to(device)
         with torch.no_grad():
             outputs = model.generate(input_ids=input_ids, max_new_tokens=512)
-
         full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        refactored_code, explanation = split_response(full_response)
 
-        if explanation.strip().lower() in ["", "explanation not found."]:
-            explanation = fallback_rag_inference(prompt)
+        refactored_code = re.search(r"```.*?\n(.*?)```", full_response, re.DOTALL)
+        refactored_code = refactored_code.group(1).strip() if refactored_code else full_response.strip()
 
-        print(f"[LOG] ✅ Refactored: {os.path.basename(filepath)}")
-        return (filepath, refactored_code, explanation, language)
+        explanation, suggestions = generate_explanation_and_suggestions(code, refactored_code, language)
+        return (
+            clean_invalid_unicode(filepath),
+            clean_invalid_unicode(refactored_code),
+            clean_invalid_unicode(explanation),
+            clean_invalid_unicode(suggestions),
+            language
+        )
 
     with ThreadPoolExecutor(max_workers=4) as executor:
-        results = list(executor.map(process_file, code_snippets))
-
-    print("[LOG] All files refactored.")
-    return results
+        return list(executor.map(process_file, code_snippets))
 
 def format_results(results):
     output = ""
-    for path, refactored_code, explanation, language in results:
+    for path, refactored_code, explanation, suggestions, language in results:
         output += f"### 📄 File: {path}\n\n"
         output += f"#### ✨ Refactored Code:\n```{language}\n{refactored_code}\n```\n\n"
-        output += f"#### 🧠 Explanation:\n{explanation}\n"
+        output += f"#### 🧠 Explanation:\n{explanation}\n\n"
+        output += f"#### 💡 Suggestions:\n{suggestions if suggestions else 'No additional suggestions.'}\n"
         output += f"\n{'-'*80}\n\n"
-    return output
+    return clean_invalid_unicode(output)
+
 
 def process_github_repo(repo_url):
     print(f"[LOG] Received repo URL: {repo_url}")
@@ -165,19 +194,17 @@ def process_github_repo(repo_url):
             load_model()
             print(f"[LOG] Cloning repo into: {temp_dir}")
             clone_repo(repo_url, temp_dir)
-            print(f"[LOG] ✅ Repo cloned.")
+            print("[LOG] ✅ Repo cloned.")
             code_files = get_code_files(temp_dir)
             print(f"[LOG] Found {len(code_files)} code files.")
-
             if not code_files:
                 return "No supported code files found in the repository."
-
             print("[LOG] 🔍 Starting analysis and refactoring...")
             results = analyze_and_refactor(code_files)
             return format_results(results)
         except Exception as e:
             print(f"[ERROR] {e}")
-            return f"❌ Error: {str(e)}"
+            return f"❌ Error: {clean_invalid_unicode(str(e))}"
 
 with gr.Blocks() as demo:
     gr.Markdown("## 🛠️ Multi-language Code Refactor & Explanation Engine")
@@ -185,6 +212,6 @@ with gr.Blocks() as demo:
     analyze_btn = gr.Button("Analyze & Refactor")
     output_box = gr.Textbox(label="Results", lines=30, interactive=False)
 
-    analyze_btn.click(fn=process_github_repo, inputs=repo_input, outputs=output_box)
+    analyze_btn.click(fn=lambda url: process_github_repo(url.strip()), inputs=repo_input, outputs=output_box)
 
-demo.launch()
+demo.launch(share=True)
