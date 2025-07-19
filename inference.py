@@ -110,22 +110,19 @@ def read_code_file(filepath):
     except Exception:
         return None
 
-def generate_explanation_and_suggestions(code: str, refactored_code: str, language: str = "code", context: str = "") -> (str, str):
+def generate_explanation_and_suggestions(code: str, refactored_code: str, language: str = "code") -> (str, str):
     prompt = f"""
-You are a code reviewer. Analyze the changes and give suggestions.
+You are a senior software developer reviewing changes in a {language} codebase.
 
-### Context:
-{context}
-
-### Original Code:
+Original Code:
 {code}
 
-### Refactored Code:
+Refactored Code:
 {refactored_code}
 
 Please do two things:
-1. Explain what was changed and why.
-2. Suggest improvements, edge cases, or potential bugs still remaining.
+1. Explain what was changed and why (in simple terms).
+2. Suggest improvements, highlight any potential bugs, or recommend best practices.
 """.strip()
 
     try:
@@ -133,8 +130,7 @@ Please do two things:
             prompt = prompt[:1500]
         result = explanation_pipeline(prompt, max_length=512, do_sample=False)
         output_text = result[0]['generated_text']
-        # Optional split logic if explanation and suggestions are clearly separated
-        return clean_invalid_unicode(output_text), ""
+        return clean_invalid_unicode(output_text), ""  # no second split needed
     except Exception:
         fallback = fallback_rag_inference(code)
         return fallback, ""
@@ -149,30 +145,27 @@ def analyze_and_refactor(code_snippets):
         filepath, code = item
         file_ext = os.path.splitext(filepath)[1]
         language = language_map.get(file_ext, "")
-        context = retrieve_similar_instruction_contexts(code)
+
         prompt = (
-            f"Refactor the following {language} code. Respond in Markdown format with:\n"
-            f"### ✨ Refactored Code:\n```{language}\n...\n```\n\n"
-            f"### 🧠 Explanation:\n...\n\n"
-            f"Code:\n{code}\n\nContext:\n{context}\n"
+            f"You are a skilled software engineer.\n"
+            f"Refactor the following {language} code to improve readability and maintainability.\n"
+            f"Respond ONLY with the refactored code, without any extra explanation.\n\n"
+            f"{code}"
         )
-        input_ids = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).input_ids.to(device)
+        input_ids = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).input_ids.to(model.device)
         with torch.no_grad():
             outputs = model.generate(input_ids=input_ids, max_new_tokens=512)
-        full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-        refactored_code = re.search(r"```.*?\n(.*?)```", full_response, re.DOTALL)
-        refactored_code = refactored_code.group(1).strip() if refactored_code else full_response.strip()
+        refactored_code = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
         explanation, suggestions = generate_explanation_and_suggestions(code, refactored_code, language)
+
         return (
             clean_invalid_unicode(filepath),
             clean_invalid_unicode(refactored_code),
             clean_invalid_unicode(explanation),
             clean_invalid_unicode(suggestions),
             language
-        )
-
+        )   
     with ThreadPoolExecutor(max_workers=4) as executor:
         return list(executor.map(process_file, code_snippets))
 
